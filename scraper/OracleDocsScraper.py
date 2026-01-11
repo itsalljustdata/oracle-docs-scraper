@@ -4,6 +4,7 @@ Oracle Documentation Scraper
 Extracts view information from Oracle Cloud documentation pages
 """
 
+from typing import Any
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import time
@@ -13,6 +14,7 @@ import logging
 from pathlib import Path
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -60,7 +62,7 @@ class OracleDocsScraper:
     def get_page(self, url: str, expand_tree: bool = False) -> None|BeautifulSoup:
         """Fetch and parse a webpage using Playwright for dynamic content"""
         try:
-            logger.info(f"Fetching (Playwright): {url}")
+            logger.debug(msg=f"Fetching (Playwright): {url}")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 # Set headers to mimic a real browser and suppress anti-scraping
@@ -221,18 +223,66 @@ class OracleDocsScraper:
                     'name': text,
                     'url': full_url
                 })
-                logger.debug(f"Found view: {text} -> {full_url}")
+                # logger.debug(f"Found view: {text} -> {full_url}")
             
             # For tables, look for items ending with _T or containing TABLE
-            elif (subcategory_type == 'Tables' and 
-                  (text.endswith('_T') or 'TABLE' in text.upper() or '_T_' in text)):
+            elif (subcategory_type == 'Tables'):
+            # elif (subcategory_type == 'Tables' and 
+            #       (text.endswith('_T') or 'TABLE' in text.upper() or '_T_' in text)):
                 full_url = urljoin(self.base_url, href)
                 item_list.append({
                     'name': text,
                     'url': full_url
                 })
-                logger.debug(f"Found table: {text} -> {full_url}")
+                # logger.debug(f"Found table: {text} -> {full_url}")
     
+    @staticmethod
+    def chopUpCommaDelimitedInListOfDicts(input_list: list[dict], key: str|None = None) -> list[dict]:
+        """Chop up comma-delimited values in a list of dicts for a specific key"""
+
+        if key is None and len(input_list) > 0:
+            keys = input_list[0].keys()
+            key= list(keys)[-1]
+
+        output_list = []
+        for item in input_list:
+            thisOne = item
+            if key in item and isinstance(item[key], str):
+                values = [v.strip() for v in item[key].split(',') if v.strip()]
+                thisOne[key] = values
+            output_list.append(thisOne)
+        return output_list
+
+    def extract_table_details(self, table_url: str, table_name: str) -> dict:
+        """Extract details, columns, and query information for a specific table"""
+        soup = self.get_page_simple(table_url)  # Use simple HTTP for view pages
+        if not soup:
+            return {'name': table_name, 'url': table_url, 'error': 'Could not fetch page'}
+        
+        table_info: dict[str, Any | str] = {
+            'name': table_name,
+            'url': table_url,
+            # 'details': {},
+            # 'columns': [],
+            # 'query': '',
+            # 'description': ''
+        }
+        # Extract additional details
+        table_info['details'] = self._extract_details(soup)
+        table_info['columns'] = self._extract_table_columns(soup)
+
+
+        for s, d, c in [(s,d,c) for s,d,c in [['Primary Key','primary_key','Columns'], ['Foreign Keys','foreign_keys','Foreign Key Column'], ['Indexes','indexes','Columns']]]:
+            tab = self._extract_soup_table(soup,s)
+            chopped = __class__.chopUpCommaDelimitedInListOfDicts(input_list=tab, key=c)
+            table_info[d] = chopped
+
+        # table_info['primary_key'] = __class__.chopUpCommaDelimitedInListOfDicts(input_list=self._extract_soup_table(soup,'Primary Key'))
+        # table_info['foreign_keys'] = __class__.chopUpCommaDelimitedInListOfDicts(input_list=self._extract_soup_table(soup,'Foreign Keys'))
+        # table_info['indexes'] = __class__.chopUpCommaDelimitedInListOfDicts(input_list=self._extract_soup_table(soup,'Indexes'))
+
+        return {k:v for k,v in table_info.items() if v}
+
     def extract_view_details(self, view_url: str, view_name: str) -> dict:
         """Extract details, columns, and query information for a specific view"""
         soup = self.get_page_simple(view_url)  # Use simple HTTP for view pages
@@ -272,6 +322,69 @@ class OracleDocsScraper:
         view_info['details'] = self._extract_details(soup)
 
         return {k:v for k,v in view_info.items() if v}
+    
+    def _extract_soup_table(self, soup: BeautifulSoup, table_summary: str) -> list[str]:
+        columns: list[dict[str, str]] = []
+        table = soup.find('table', attrs={'summary': table_summary})
+        if not table:
+            return columns
+        thead = table.find('thead')
+        if not thead:
+            return columns
+        column_names = [th.get_text(strip=True) for th in thead.find_all('th')]
+
+        tbody = table.find('tbody')
+
+        if tbody:
+            for tr in tbody.find_all('tr'):
+                # Extract all td elements from the current row
+                tds = tr.find_all('td')
+                
+                # Create a dictionary with column names as keys and td text as values
+                row_dict = {}
+                for i, column_name in enumerate(column_names):
+                    if i < len(tds):
+                        row_dict[column_name] = tds[i].get_text(strip=True)
+                
+                columns.append(row_dict)
+
+        return columns
+    
+    def _extract_table_columns(self, soup: BeautifulSoup) -> list[str]:
+        cols = self._extract_soup_table(soup, table_summary='Columns')
+        colsOut = []
+        for colId, c in enumerate(cols,1):
+            colMod = c.copy()
+            comment = colMod.get('Comments','').rstrip('*').rstrip()
+            if (
+                comment and (
+                    comment.upper() == colMod.get('Name','').upper()
+                    or comment.upper().startswith('WHO COLUMN: ') # Nullify for who cols
+                    or colMod.get('Name','').upper() == 'OBJECT_VERSION_NUMBER' # Nullify for version number cols
+                )
+            ):
+                _ = colMod.pop('Comments',None)
+            else:
+                colMod['Comments'] = comment
+            for k, v in colMod.items():
+                if not isinstance(v,str):
+                    continue
+                if len(v) == 0:
+                    colMod[k] = None
+                else:
+                    try:
+                        asInt = int(v)
+                        colMod[k] = asInt
+                    except: pass
+            if (Precision := colMod.pop('Precision', None)) is not None:
+                colMod['Length'] = Precision
+            if colMod.pop('Not-null','') == "Yes":
+                colMod['NotNull'] = True
+            colMod = {k:v for k,v in {"colId": colId, **colMod}.items() if not isinstance(v,type(None))}
+            colsOut.append(colMod)
+        return colsOut
+
+        #contentContainer > article > div > div > div > section:nth-child(5) > div > table
     
     def _extract_view_columns(self, soup: BeautifulSoup) -> list[str]:
         """Extract column information from the page"""
@@ -332,6 +445,9 @@ class OracleDocsScraper:
                 next_element = next_element.find_next_sibling()
         
         return columns
+    
+        
+
     
     def _extract_query(self, soup: BeautifulSoup) -> str:
         """Extract SQL query if available"""
@@ -469,7 +585,8 @@ class OracleDocsScraper:
         
         return details
     
-    def scrape_all_views(self, max_workers: int = 10) -> list[dict]:
+    def scrape_all_views_tabs(self, max_workers: int = 30) -> tuple[list[dict],list[dict]]:
+    
         """Main method to scrape all views from the documentation"""
         logger.debug(f"Starting scrape of {self.base_url}")
         
@@ -485,17 +602,30 @@ class OracleDocsScraper:
             logger.error("Could not find navigation structure. Aborting.")
             raise RuntimeError("Could not find navigation structure.")
 
+
         # Collect all view info first
         all_view_tasks = []
+        all_table_tasks = []
         for category, content in navigation.items():
             logger.debug(f"Processing category: {category}")
             views = content.get('Views', []) if isinstance(content, dict) else []
+            tables = content.get('Tables', []) if isinstance(content, dict) else []
             for view_info in views:
                 view_name = view_info.get('name', '')
-                view_url = view_info.get('url', '')
+                view_url: Any = view_info.get('url', '')
                 all_view_tasks.append((view_url, view_name, category))
+            for table_info in tables:
+                table_name = table_info.get('name', '')
+                table_url = table_info.get('url', '')
+                if table_name.endswith('_'):
+                    logger.debug(f"{table_name} : Skipping")
+                    continue
+                all_table_tasks.append((table_url, table_name, category))
         
-        logger.debug(f"Found {len(all_view_tasks)} views to process")
+        # all_view_tasks: list[Any]= all_view_tasks[0:5]
+        # all_table_tasks: list[Any]= all_table_tasks[0:50]
+        
+        logger.debug(f"Found {len(all_view_tasks)} views, {len(all_table_tasks)} tables to process")
         
         # Process views in parallel using ThreadPoolExecutor
         all_views = []
@@ -522,13 +652,52 @@ class OracleDocsScraper:
                         'category': 'Unknown'
                     })
         
-        return all_views
+        # Process tables in parallel using ThreadPoolExecutor
+        # logger.debug(json.dumps(tables,indent=2))
+
+        all_tables = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_table = {
+                executor.submit(self._process_single_table, table_url, table_name, category): (table_name, table_url)
+                for table_url, table_name, category in all_table_tasks
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_table):
+                table_name, table_url = future_to_table[future]
+                try:
+                    table_details = future.result()
+                    all_tables.append(table_details)
+                except Exception as e:
+                    logger.error(f"Error processing table {table_name} ({table_url}): {e}")
+                    # Add error entry
+                    all_tables.append({
+                        'name': table_name,
+                        'url': table_url,
+                        'error': str(e),
+                        'category': 'Unknown'
+                    })
+        
+        
+        
+        return all_views,all_tables
+
+    def scrape_all_views(self, max_workers: int = 10) -> list[dict]:
+        vws, _ = self.scrape_all_views_tabs(max_workers=max_workers)
+        return vws
     
     def _process_single_view(self, view_url: str, view_name: str, category: str) -> dict:
         """Process a single view (for use in threading)"""
         view_details = self.extract_view_details(view_url, view_name)
         view_details['category'] = category
         return view_details
+    
+    def _process_single_table(self, table_url: str, table_name: str, category: str) -> dict:
+        """Process a single view (for use in threading)"""
+        table_details = self.extract_table_details(table_url, table_name)
+        table_details['category'] = category
+        return table_details
     
     # def _fallback_scrape(self, soup: BeautifulSoup) -> list[dict]:
     #     """Fallback method if navigation structure is not found"""

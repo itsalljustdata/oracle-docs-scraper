@@ -135,7 +135,7 @@ celerybeat.pid
 *.sage.py
 
 .vscode/
-output/*
+output/*.zip
 
 # Environments
 .env
